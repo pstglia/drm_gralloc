@@ -299,10 +299,10 @@ int gralloc_drm_reserve_plane(struct gralloc_drm_t *drm,
 	uint32_t src_w,
 	uint32_t src_h)
 {
-	unsigned int i, j;
+	__u32 j;
 	struct gralloc_drm_handle_t *drm_handle =
 		gralloc_drm_handle(handle);
-	int plane_count = drm->plane_resources->count_planes;
+	__u32 plane_count = drm->plane_resources->count_planes;
 	struct gralloc_drm_plane_t *plane = drm->planes;
 
 	/* no supported planes for this handle */
@@ -1077,7 +1077,7 @@ static void *hdmi_observer(void *data)
 int gralloc_drm_init_kms(struct gralloc_drm_t *drm)
 {
 	drmModeConnectorPtr lvds, hdmi;
-	int i, ret;
+	int ret;
 
 	if (drm->resources)
 		return 0;
@@ -1092,6 +1092,7 @@ int gralloc_drm_init_kms(struct gralloc_drm_t *drm)
 	if (!drm->plane_resources) {
 		ALOGD("no planes found from drm resources");
 	} else {
+		__u32 i;
 		ALOGD("supported drm planes and formats");
 		/* fill a helper structure for hwcomposer */
 		drm->planes = calloc(drm->plane_resources->count_planes,
@@ -1124,6 +1125,7 @@ int gralloc_drm_init_kms(struct gralloc_drm_t *drm)
 
 	/* if still no connector, find first connected connector and try it */
 	if (!drm->primary.active) {
+		int i;
 
 		for (i = 0; i < drm->resources->count_connectors; i++) {
 			drmModeConnectorPtr connector;
