@@ -32,28 +32,29 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <drm.h>
-#include <nouveau_drmif.h>
-#include <nouveau_channel.h>
-#include <nouveau_bo.h>
+#include <nouveau.h>
 
 #include "gralloc_drm.h"
 #include "gralloc_drm_priv.h"
-
-#define MAX(a, b) (((a) > (b)) ? (a) : (b))
-
-#define NVC0_TILE_HEIGHT(m) (8 << ((m) >> 4))
-
-enum {
-	NvDmaFB = 0xd8000001,
-	NvDmaTT = 0xd8000002,
-};
+#include "gralloc_drm_nouveau.h"
 
 struct nouveau_info {
 	struct gralloc_drm_drv_t base;
 
 	int fd;
 	struct nouveau_device *dev;
-	struct nouveau_channel *chan;
+	struct nouveau_object *chan;
+	struct nouveau_client *client;
+        struct nouveau_pushbuf *pushbuf;
+        struct nouveau_bufctx *bufctx;
+	struct nouveau_object *ce_channel;
+	struct nouveau_pushbuf *ce_pushbuf;
+	struct nouveau_object *Nv2D;
+	struct nouveau_object *Nv3D;
+	struct nouveau_object *NvMemFormat;
+	struct nouveau_bo *scratch;
+	struct nouveau_object *NvSW;
+	int              currentRop;
 	int arch;
 	int tiled_scanout;
 };
@@ -64,22 +65,65 @@ struct nouveau_buffer {
 	struct nouveau_bo *bo;
 };
 
+/* Copied from xf86-video-nouveau (nouveau_local.h) */
+static inline int log2i(int i)
+{
+        int r = 0;
+
+        if (i & 0xffff0000) {
+                i >>= 16;
+                r += 16;
+        }
+        if (i & 0x0000ff00) {
+                i >>= 8;
+                r += 8;
+        }
+        if (i & 0x000000f0) {
+                i >>= 4;
+                r += 4;
+        }
+        if (i & 0x0000000c) {
+                i >>= 2;
+                r += 2;
+        }
+        if (i & 0x00000002) {
+                r += 1;
+        }
+        return r;
+}
+
+/* Copied from xf86-video-nouveau (nouveau_local.h) */
+static inline int round_down_pow2(int x)
+{
+        return 1 << log2i(x);
+}
+
+
 static struct nouveau_bo *alloc_bo(struct nouveau_info *info,
 		int width, int height, int cpp, int usage, int *pitch)
 {
 	struct nouveau_bo *bo = NULL;
 	int flags, tile_mode, tile_flags;
-	int tiled, scanout;
+	int tiled, scanout,  sw_indicator;
 	unsigned int align;
+	union nouveau_bo_config bo_config;
 
 	flags = NOUVEAU_BO_MAP | NOUVEAU_BO_VRAM;
 	tile_mode = 0;
 	tile_flags = 0;
 
-	scanout = !!(usage & GRALLOC_USAGE_HW_FB);
+	scanout = (usage & GRALLOC_USAGE_HW_FB);
 
 	tiled = !(usage & (GRALLOC_USAGE_SW_READ_OFTEN |
 			   GRALLOC_USAGE_SW_WRITE_OFTEN));
+
+	/* pstglia note: */
+	/* Noted when using GRALLOC_USAGE_SW_READ_OFTEN or GRALLOC_USAGE_SW_WRITE_OFTEN, tiled must be false */
+	/* Otherwise, mouse cursor and overlay windows are corrupted (setting a memtype supposed to be used for tiled bo's */	
+	/* If this is not correct, please fix it */
+	sw_indicator = (usage & (GRALLOC_USAGE_SW_READ_OFTEN |
+			   GRALLOC_USAGE_SW_WRITE_OFTEN));
+
 	if (!info->chan)
 		tiled = 0;
 	else if (scanout && info->tiled_scanout)
@@ -96,55 +140,67 @@ static struct nouveau_bo *alloc_bo(struct nouveau_info *info,
 
 	*pitch = ALIGN(width * cpp, align);
 
+	ALOGI("DEBUG PST - inside function alloc_bo: tiled: %d; scanout: %d; usage: %d", tiled, scanout, usage);
+	ALOGI("DEBUG PST - inside function alloc_bo (2): cpp: %d; pitch: %d; width: %d;height: %d", cpp, *pitch, width, height);
+
 	if (tiled) {
 		if (info->arch >= 0xc0) {
+			ALOGI("DEBUG PST - arch is 0xc0 or higher - setting tile_flags, align, height");
 			if (height > 64)
-				tile_mode = 0x40;
+				tile_mode = 0x040;
 			else if (height > 32)
-				tile_mode = 0x30;
+				tile_mode = 0x030;
 			else if (height > 16)
-				tile_mode = 0x20;
+				tile_mode = 0x020;
 			else if (height > 8)
-				tile_mode = 0x10;
+				tile_mode = 0x010;
 			else
-				tile_mode = 0x00;
+				tile_mode = 0x000;
 
-			tile_flags = 0xfe00;
+			if ( sw_indicator ) {
+				tile_flags = 0x00;
+			}
+			else {
+				tile_flags = 0xfe;
+			}
 
 			align = NVC0_TILE_HEIGHT(tile_mode);
 			height = ALIGN(height, align);
 		}
 		else if (info->arch >= 0x50) {
+			ALOGI("DEBUG PST - arch is 0x50 - setting tile_flags, align, height");
 			if (height > 32)
-				tile_mode = 4;
+				tile_mode = 0x040;
 			else if (height > 16)
-				tile_mode = 3;
+				tile_mode = 0x030;
 			else if (height > 8)
-				tile_mode = 2;
+				tile_mode = 0x020;
 			else if (height > 4)
-				tile_mode = 1;
+				tile_mode = 0x010;
 			else
-				tile_mode = 0;
+				tile_mode = 0x000;
 
-			tile_flags = (scanout && cpp != 2) ? 0x7a00 : 0x7000;
+			if (sw_indicator) {
+				tile_flags = 0x00;
+			}
+			else {
+				if (scanout)
+					tile_flags = (cpp == 2) ? 0x070 : 0x07a;
+				else {
+					tile_flags = 0x070;
+				}
+			}
 
-			align = 1 << (tile_mode + 2);
+			/*align = 1 << (tile_mode + 2);*/
+			align = NV50_TILE_HEIGHT(tile_mode);
 			height = ALIGN(height, align);
 		}
 		else {
-			align = *pitch / 4;
-
-			/* round down to the previous power of two */
-			align >>= 1;
-			align |= align >> 1;
-			align |= align >> 2;
-			align |= align >> 4;
-			align |= align >> 8;
-			align |= align >> 16;
-			align++;
+			
+			ALOGI("DEBUG PST - arch is 0x4n or lower - setting align and tile_mode");
 
 			align = MAX((info->dev->chipset >= 0x40) ? 1024 : 256,
-					align);
+					round_down_pow2(*pitch / 4));
 
 			/* adjust pitch */
 			*pitch = ALIGN(*pitch, align);
@@ -153,19 +209,45 @@ static struct nouveau_bo *alloc_bo(struct nouveau_info *info,
 		}
 	}
 
-	if (cpp == 4)
-		tile_flags |= NOUVEAU_BO_TILE_32BPP;
-	else if (cpp == 2)
-		tile_flags |= NOUVEAU_BO_TILE_16BPP;
+	/* setting tile_mode and memtype(tile_flags?) - START */
+	if (info->arch >= 0xc0) {
+		bo_config.nvc0.memtype = tile_flags;
+		bo_config.nvc0.tile_mode = tile_mode;
+	}
+	else if (info->arch >= 0x50) {
+		bo_config.nv50.memtype = tile_flags;
+		bo_config.nv50.tile_mode = tile_mode;
+	}
+	else {
+		if (sw_indicator) {
+			bo_config.nv04.surf_flags = 0x00;
+		}
+		else {
+			if ( cpp == 2 )
+				bo_config.nv04.surf_flags |= NV04_BO_16BPP;
+			if ( cpp == 4 )
+				bo_config.nv04.surf_flags |= NV04_BO_32BPP;
+		}
+		bo_config.nv04.surf_pitch = tile_mode;
+	}
+	/* setting tile_mode and memtype(tile_flags?) - END */
 
-	if (scanout)
-		tile_flags |= NOUVEAU_BO_TILE_SCANOUT;
+	/* pstglia: xf86-video-nouveau do this - I'll copy */
+	if (scanout) {
+		flags |= NOUVEAU_BO_CONTIG;
+	}
 
-	if (nouveau_bo_new_tile(info->dev, flags, 0, *pitch * height,
-				tile_mode, tile_flags, &bo)) {
+	if (nouveau_bo_new(info->dev, flags, 0, *pitch * height,
+				&bo_config, &bo)) {
 		ALOGE("failed to allocate bo (flags 0x%x, size %d, tile_mode 0x%x, tile_flags 0x%x)",
 				flags, *pitch * height, tile_mode, tile_flags);
 		bo = NULL;
+	}
+
+	if (bo->map != NULL) {
+		ALOGI("PST DEBUG - bo->map is not NULL after nouveau_bo_new");
+		/* Setting created bo map to NULL */
+		bo->map = NULL;
 	}
 
 	return bo;
@@ -189,7 +271,7 @@ nouveau_alloc(struct gralloc_drm_drv_t *drv, struct gralloc_drm_handle_t *handle
 		return NULL;
 
 	if (handle->name) {
-		if (nouveau_bo_handle_ref(info->dev, handle->name, &nb->bo)) {
+		if (nouveau_bo_name_ref(info->dev, handle->name, &nb->bo)) {
 			ALOGE("failed to create nouveau bo from name %u",
 					handle->name);
 			free(nb);
@@ -212,7 +294,7 @@ nouveau_alloc(struct gralloc_drm_drv_t *drv, struct gralloc_drm_handle_t *handle
 			return NULL;
 		}
 
-		if (nouveau_bo_handle_get(nb->bo,
+		if (nouveau_bo_name_get(nb->bo,
 					(uint32_t *) &handle->name)) {
 			ALOGE("failed to flink nouveau bo");
 			nouveau_bo_ref(NULL, &nb->bo);
@@ -243,18 +325,33 @@ static int nouveau_map(struct gralloc_drm_drv_t *drv,
 		struct gralloc_drm_bo_t *bo, int x, int y, int w, int h,
 		int enable_write, void **addr)
 {
+	struct nouveau_info *info = (struct nouveau_info *) drv;
 	struct nouveau_buffer *nb = (struct nouveau_buffer *) bo;
 	uint32_t flags;
 	int err;
+
 
 	flags = NOUVEAU_BO_RD;
 	if (enable_write)
 		flags |= NOUVEAU_BO_WR;
 
+	ALOGI("DEBUG PST -Trying nouveau_bo_map - enable_write: %d", enable_write);
+
+	/* Setting nb->bo->map as NULL before calling nouveau_bo_map) */
+	/* Setting now after bo creation */
+	/*nb->bo->map = NULL;*/
+
 	/* TODO if tiled, allocate a linear copy of bo in GART and map it */
-	err = nouveau_bo_map(nb->bo, flags);
-	if (!err)
+	/*err = nouveau_bo_map(nb->bo, flags, client);*/
+	err = nouveau_bo_map(nb->bo, flags, info->client);
+	ALOGI("MAURO DEBUG - Value of err %d", err);
+
+	if (!err) {
 		*addr = nb->bo->map;
+	}
+	else {
+		ALOGE("DEBUG PST - Error on nouveau_map");
+	}
 
 	return err;
 }
@@ -262,9 +359,18 @@ static int nouveau_map(struct gralloc_drm_drv_t *drv,
 static void nouveau_unmap(struct gralloc_drm_drv_t *drv,
 		struct gralloc_drm_bo_t *bo)
 {
+	struct nouveau_info *info = (struct nouveau_info *) drv;
 	struct nouveau_buffer *nb = (struct nouveau_buffer *) bo;
 	/* TODO if tiled, unmap the linear bo and copy back */
-	nouveau_bo_unmap(nb->bo);
+
+	ALOGI("DEBUG PST - Inside nouveau_unmap");
+
+	/* Replaced noveau_bo_unmap (not existant in libdrm anymore) by these 2 cmd  */
+	/* nouveau_bo_del execute these cmds, but it also release the bo... */
+	/* TODO: Confirm if this is the best way for unmapping bo */
+	munmap(nb->bo->map, nb->bo->size);
+	nb->bo->map = NULL;
+
 }
 
 static void nouveau_init_kms_features(struct gralloc_drm_drv_t *drv,
@@ -274,7 +380,9 @@ static void nouveau_init_kms_features(struct gralloc_drm_drv_t *drv,
 
 	switch (drm->primary.fb_format) {
 	case HAL_PIXEL_FORMAT_BGRA_8888:
-	case HAL_PIXEL_FORMAT_RGB_565:
+	/* pstglia: This mode (HAL_PIXEL_FORMAT_RGB_565) was not supported in my tests - so I disabled it*/
+	/* please confirm it */
+	//case HAL_PIXEL_FORMAT_RGB_565:
 		break;
 	default:
 		drm->primary.fb_format = HAL_PIXEL_FORMAT_BGRA_8888;
@@ -288,13 +396,45 @@ static void nouveau_init_kms_features(struct gralloc_drm_drv_t *drv,
 	drm->vblank_secondary = 0;
 }
 
+// TakeDown DMA Allocation (channels, buffers, etc) 
+// pstglia NOTE: It's a copy from xf86-video-nouveau NVTakedownDma 
+
+void nouveau_takedown_dma(struct nouveau_info *info)
+{
+        if (info->ce_channel) {
+                struct nouveau_fifo *fifo = info->ce_channel->data;
+                int chid = fifo->channel;
+
+                nouveau_pushbuf_del(&info->ce_pushbuf);
+                nouveau_object_del(&info->ce_channel);
+
+		ALOGI("PST DEBUG - Closed GPU CE channel %d\n", chid);
+
+        }
+
+        if (info->chan) {
+                struct nouveau_fifo *fifo = info->chan->data;
+                int chid = fifo->channel;
+
+                nouveau_bufctx_del(&info->bufctx);
+                nouveau_pushbuf_del(&info->pushbuf);
+                nouveau_object_del(&info->chan);
+
+		ALOGI("PST DEBUG - Closed GPU channel %d\n", chid);
+        }
+}
+
 static void nouveau_destroy(struct gralloc_drm_drv_t *drv)
 {
 	struct nouveau_info *info = (struct nouveau_info *) drv;
 
-	if (info->chan)
-		nouveau_channel_free(&info->chan);
-	nouveau_device_close(&info->dev);
+	if (info->chan) {
+		nouveau_takedown_dma(info);
+		info->chan = NULL;
+	}
+
+	
+	nouveau_device_del(&info->dev);
 	free(info);
 }
 
@@ -326,7 +466,12 @@ static int nouveau_init(struct nouveau_info *info)
 		info->arch = 0x50;
 		break;
 	case 0xc0:
+	case 0xd0:
 		info->arch = 0xc0;
+		break;
+	case 0xe0:
+	case 0xf0:
+		info->arch = 0xe0;
 		break;
 	default:
 		ALOGE("unknown nouveau chipset 0x%x", info->dev->chipset);
@@ -339,36 +484,136 @@ static int nouveau_init(struct nouveau_info *info)
 	return err;
 }
 
+
 struct gralloc_drm_drv_t *gralloc_drm_drv_create_for_nouveau(int fd)
 {
 	struct nouveau_info *info;
 	int err;
+
+	/* channel variables */
+	struct nv04_fifo nv04_data = {	.vram = NvDmaFB,
+					.gart = NvDmaTT };
+	struct nvc0_fifo nvc0_data = { };
+	struct nouveau_object *device;
+	struct nouveau_fifo *fifo;
+	int size;	
+	void *data;
 
 	info = calloc(1, sizeof(*info));
 	if (!info)
 		return NULL;
 
 	info->fd = fd;
-	err = nouveau_device_open_existing(&info->dev, 0, info->fd, 0);
+	err = nouveau_device_wrap(info->fd, 0,  &info->dev);
 	if (err) {
 		ALOGE("failed to create nouveau device");
 		free(info);
 		return NULL;
 	}
-
-	err = nouveau_channel_alloc(info->dev, NvDmaFB, NvDmaTT,
-			24 * 1024, &info->chan);
-	if (err) {
-		/* make it non-fatal temporarily as it may require firmwares */
-		ALOGW("failed to create nouveau channel");
-		info->chan = NULL;
+	else
+	{
+		ALOGI("DEBUG PST - nouveau device created");
 	}
+
+	/*
+	*err = nouveau_channel_alloc(info->dev, NvDmaFB, NvDmaTT,
+	*		24 * 1024, &info->chan);
+	*if (err) {
+	*	 make it non-fatal temporarily as it may require firmwares 
+	*	ALOGW("failed to create nouveau channel");
+	*	info->chan = NULL;
+	*}
+	*/
+
+	/* pstglia NOTE (2014-06-08): Started to copy/transcript NVInitDma from xf86-video-nouveau
+	* But the question is: Ok, I'm allocating dma channels and buffers to read/write
+	* data, but how gralloc will use them? nouveau_client, channel, and the buffers
+	* are structures declared outside gralloc_drm_drv_t scope. xf86-video-nouveau
+	* have extra functions to read and write these dma buffers. Maybe this need
+	* gralloc coding. Well, it's out of my bounds. My limited knowledge tells me it's
+	* better trying to work without dma (if this is possible)
+	*
+	* 
+	*
+	*/
+	// creating a client 
+	device = &info->dev->object;
+	info->chan = NULL;
+	info->ce_channel = NULL;
+	info->client = NULL;
+
+
+	err  = nouveau_client_new(info->dev, &info->client);
+	
+	if (err) {
+		ALOGE("PST DEBUG - Could not define a nouveau client - Forcing channel NULL");
+		info->chan = NULL;
+		info->ce_channel = NULL;
+		info->client = NULL;
+	}
+
+	
+	if (info->client) {
+	
+	// Creating the gpu channel (based on xf86-video-nouveau - nv_dma.c)
+	// Note1: Putting all this code on a separated function is a good idea. Cleaner code
+	// Note2: How to deal with this push buffers?
+		ALOGI("PST DEBUG - Before setting data and size for channel");
+		if (info->arch < 0xc0) {
+			data = &nv04_data;
+			size = sizeof(nv04_data);
+		}
+		else {
+			data = &nvc0_data;
+			size = sizeof(nvc0_data);
+		}
+	
+	
+		ALOGI("PST DEBUG - Before NOUVEAU_FIFO_CHANNEL_CLASS");
+		err = nouveau_object_new(device, 0, NOUVEAU_FIFO_CHANNEL_CLASS, 
+					data, size, &info->chan);
+	
+		if (err) {
+			ALOGE("PST DEBUG - Error on nouveau_object_new (creating GPU channel) - Forcing channel NULL");
+			info->chan = NULL;
+			info->ce_channel = NULL;
+		}
+		else {
+			
+			ALOGI("PST DEBUG - Before err = nouveau_pushbuf_new");
+			fifo = info->chan->data;
+			err = nouveau_pushbuf_new(info->client, info->chan, 4, 32 * 1024,
+					true, &info->pushbuf);
+	
+			if (err) {
+				ALOGE("PST DEBUG - Error alocating push buffer");
+				nouveau_takedown_dma(info);
+				info->chan = NULL;
+			}
+			else {
+				ALOGI("PST DEBUG - Before err = nouveau_bufctx_new");
+				err = nouveau_bufctx_new(info->client, 1, &info->bufctx);
+
+				if (err) {
+					ALOGE("PST DEBUG - Error allocating bufctx");
+					nouveau_takedown_dma(info);
+					info->chan = NULL;
+					
+				}
+			}
+		}
+	
+	}	
 
 	err = nouveau_init(info);
 	if (err) {
-		if (info->chan)
-			nouveau_channel_free(&info->chan);
-		nouveau_device_close(&info->dev);
+		if (info->chan) {
+			nouveau_takedown_dma(info);
+			info->chan = NULL;
+		}
+		
+		ALOGE("DEBUG PST - nouveau_init failed");
+		nouveau_device_del(&info->dev);
 		free(info);
 		return NULL;
 	}
