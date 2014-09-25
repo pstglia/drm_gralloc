@@ -219,15 +219,10 @@ static struct nouveau_bo *alloc_bo(struct nouveau_info *info,
 		bo_config.nv50.tile_mode = tile_mode;
 	}
 	else {
-		if (sw_indicator) {
-			bo_config.nv04.surf_flags = 0x00;
-		}
-		else {
-			if ( cpp == 2 )
-				bo_config.nv04.surf_flags |= NV04_BO_16BPP;
-			if ( cpp == 4 )
-				bo_config.nv04.surf_flags |= NV04_BO_32BPP;
-		}
+		if ( cpp == 2 )
+			bo_config.nv04.surf_flags |= NV04_BO_16BPP;
+		if ( cpp == 4 )
+			bo_config.nv04.surf_flags |= NV04_BO_32BPP;
 		bo_config.nv04.surf_pitch = tile_mode;
 	}
 	/* setting tile_mode and memtype(tile_flags?) - END */
@@ -245,10 +240,11 @@ static struct nouveau_bo *alloc_bo(struct nouveau_info *info,
 	}
 
 	if (bo->map != NULL) {
-		ALOGI("PST DEBUG - bo->map is not NULL after nouveau_bo_new");
-		/* Setting created bo map to NULL */
-		bo->map = NULL;
+		ALOGI("PST DEBUG - bo->map is not not just after nouveau_bo_new");
 	}
+
+	/* Setting created bo map to NULL */
+	bo->map = NULL;
 
 	return bo;
 }
@@ -359,7 +355,6 @@ static int nouveau_map(struct gralloc_drm_drv_t *drv,
 static void nouveau_unmap(struct gralloc_drm_drv_t *drv,
 		struct gralloc_drm_bo_t *bo)
 {
-	struct nouveau_info *info = (struct nouveau_info *) drv;
 	struct nouveau_buffer *nb = (struct nouveau_buffer *) bo;
 	/* TODO if tiled, unmap the linear bo and copy back */
 
@@ -370,7 +365,6 @@ static void nouveau_unmap(struct gralloc_drm_drv_t *drv,
 	/* TODO: Confirm if this is the best way for unmapping bo */
 	munmap(nb->bo->map, nb->bo->size);
 	nb->bo->map = NULL;
-
 }
 
 static void nouveau_init_kms_features(struct gralloc_drm_drv_t *drv,
@@ -424,11 +418,235 @@ void nouveau_takedown_dma(struct nouveau_info *info)
         }
 }
 
+// Destroy objects used for Accel
+void nouveau_accel_free(struct nouveau_info *info)
+{
+        nouveau_object_del(&info->Nv2D);
+        nouveau_object_del(&info->NvMemFormat);
+	nouveau_bo_ref(NULL, &info->scratch);
+}
+
+/* Init 2D for NVC0 Family */
+/* Copy from nvc0_accel.c xf86-video-nouveau */
+/*
+int nouveau_init2D_NVC0(struct nouveau_info *info)
+{
+        struct nouveau_pushbuf *push = info->pushbuf;
+        int ret;
+
+        ret = nouveau_object_new(info->chan, 0x0000902d, 0x902d,
+                                 NULL, 0, &info->Nv2D);
+        if (ret)
+                return FALSE;
+
+        if (!PUSH_SPACE(push, 64))
+                return FALSE;
+
+        BEGIN_NVC0(push, NV01_SUBC(2DNVC0, OBJECT), 1);
+        PUSH_DATA (push, info->Nv2D->handle);
+
+        BEGIN_NVC0(push, NV50_2DNVC0(CLIP_ENABLE), 1);
+        PUSH_DATA (push, 1);
+        BEGIN_NVC0(push, NV50_2DNVC0(COLOR_KEY_ENABLE), 1);
+        PUSH_DATA (push, 0);
+        BEGIN_NVC0(push, SUBC_2DNVC0(0x0884), 1);
+        PUSH_DATA (push, 0x3f);
+        BEGIN_NVC0(push, SUBC_2DNVC0(0x0888), 1);
+        PUSH_DATA (push, 1);
+        BEGIN_NVC0(push, NV50_2DNVC0(ROP), 1);
+        PUSH_DATA (push, 0x55);
+        BEGIN_NVC0(push, NV50_2DNVC0(OPERATION), 1);
+        PUSH_DATA (push, NV50_2D_OPERATION_SRCCOPY);
+
+        BEGIN_NVC0(push, NV50_2DNVC0(BLIT_DU_DX_FRACT), 4);
+        PUSH_DATA (push, 0);
+        PUSH_DATA (push, 1);
+        PUSH_DATA (push, 0);
+        PUSH_DATA (push, 1);
+        BEGIN_NVC0(push, NV50_2DNVC0(DRAW_SHAPE), 2);
+        PUSH_DATA (push, 4);
+        PUSH_DATA (push, NV50_SURFACE_FORMAT_B5G6R5_UNORM);
+        BEGIN_NVC0(push, NV50_2DNVC0(PATTERN_COLOR_FORMAT), 2);
+        PUSH_DATA (push, 2);
+        PUSH_DATA (push, 1);
+
+        info->currentRop = 0xfffffffa;
+        return TRUE;
+}
+*/
+
+/*
+int nouveau_initM2MF_NVC0(struct nouveau_info *info)
+{
+        struct nouveau_pushbuf *push = info->pushbuf;
+        int ret;
+
+        ret = nouveau_object_new(info->chan, 0x00009039, 0x9039,
+                                 NULL, 0, &info->NvMemFormat);
+        if (ret)
+                return FALSE;
+
+        BEGIN_NVC0(push, NV01_SUBC(M2MFNVC0, OBJECT), 1);
+        PUSH_DATA (push, info->NvMemFormat->handle);
+        BEGIN_NVC0(push, NVC0_M2MF(QUERY_ADDRESS_HIGH), 3);
+        PUSH_DATA (push, (info->scratch->offset + NTFY_OFFSET) >> 32);
+        PUSH_DATA (push, (info->scratch->offset + NTFY_OFFSET));
+        PUSH_DATA (push, 0);
+
+        return TRUE;
+}
+*/
+
+/*
+int nouveau_init3D_NVC0(struct nouveau_info *info)
+{
+        struct nouveau_pushbuf *push = info->pushbuf;
+        struct nouveau_bo *bo = info->scratch;
+        uint32_t class, handle;
+        int ret;
+
+        if (info->arch < 0xe0) {
+                class  = 0x9097;
+                handle = 0x001f906e;
+        } else
+        if (info->dev->chipset < 0xf0) {
+                class  = 0xa097;
+                handle = 0x0000906e;
+        } else {
+                class  = 0xa197;
+                handle = 0x0000906e;
+        }
+
+        ret = nouveau_object_new(info->chan, class, class,
+                                 NULL, 0, &info->Nv3D);
+        if (ret)
+                return FALSE;
+
+        ret = nouveau_object_new(info->chan, handle, 0x906e,
+                                 NULL, 0, &info->NvSW);
+        if (ret) {
+        	ALOGE("DRM doesn't support sync-to-vblank");
+        }
+
+        if (nouveau_pushbuf_space(push, 512, 0, 0) ||
+            nouveau_pushbuf_refn (push, &(struct nouveau_pushbuf_refn) {
+                                        info->scratch, NOUVEAU_BO_VRAM |
+                                        NOUVEAU_BO_WR }, 1))
+                return FALSE;
+
+        BEGIN_NVC0(push, NV01_SUBC(3D, OBJECT), 1);
+        PUSH_DATA (push, pNv->Nv3D->handle);
+        BEGIN_NVC0(push, NVC0_3D(COND_MODE), 1);
+        PUSH_DATA (push, NVC0_3D_COND_MODE_ALWAYS);
+        BEGIN_NVC0(push, SUBC_3D(NVC0_GRAPH_NOTIFY_ADDRESS_HIGH), 3);
+        PUSH_DATA (push, (pNv->scratch->offset + NTFY_OFFSET) >> 32);
+        PUSH_DATA (push, (pNv->scratch->offset + NTFY_OFFSET));
+        PUSH_DATA (push, 0);
+        BEGIN_NVC0(push, NVC0_3D(LINKED_TSC), 1);
+        PUSH_DATA (push, 1);
+        if (pNv->Architecture < NV_ARCH_E0) {
+                BEGIN_NVC0(push, NVC0_3D(TEX_LIMITS(4)), 1);
+                PUSH_DATA (push, 0x54);
+                BEGIN_NIC0(push, NVC0_3D(BIND_TIC(4)), 2);
+                PUSH_DATA (push, (0 << 9) | (0 << 1) | NVC0_3D_BIND_TIC_ACTIVE);
+                PUSH_DATA (push, (1 << 9) | (1 << 1) | NVC0_3D_BIND_TIC_ACTIVE);
+        } else {
+                BEGIN_NVC0(push, NVC0_3D(CB_SIZE), 6);
+                PUSH_DATA (push, 256);
+                PUSH_DATA (push, (bo->offset + TB_OFFSET) >> 32);
+                PUSH_DATA (push, (bo->offset + TB_OFFSET));
+                PUSH_DATA (push, 0);
+                PUSH_DATA (push, 0x00000000);
+                PUSH_DATA (push, 0x00000001);
+                BEGIN_NVC0(push, NVC0_3D(CB_BIND(4)), 1);
+                PUSH_DATA (push, 0x11);
+                BEGIN_NVC0(push, SUBC_3D(0x2608), 1);
+                PUSH_DATA (push, 1);
+        }
+
+        BEGIN_NVC0(push, NVC0_3D(VERTEX_QUARANTINE_ADDRESS_HIGH), 3);
+        PUSH_DATA (push, (bo->offset + MISC_OFFSET) >> 32);
+        PUSH_DATA (push, (bo->offset + MISC_OFFSET));
+        PUSH_DATA (push, 1);
+
+        BEGIN_NVC0(push, NVC0_3D(CODE_ADDRESS_HIGH), 2);
+        PUSH_DATA (push, (bo->offset + CODE_OFFSET) >> 32);
+        PUSH_DATA (push, (bo->offset + CODE_OFFSET));
+        if (pNv->Architecture < NV_ARCH_E0) {
+                NVC0PushProgram(pNv, PVP_PASS, NVC0VP_Transform2);
+                NVC0PushProgram(pNv, PFP_S, NVC0FP_Source);
+                NVC0PushProgram(pNv, PFP_C, NVC0FP_Composite);
+                NVC0PushProgram(pNv, PFP_CCA, NVC0FP_CAComposite);
+                NVC0PushProgram(pNv, PFP_CCASA, NVC0FP_CACompositeSrcAlpha);
+                NVC0PushProgram(pNv, PFP_S_A8, NVC0FP_Source_A8);
+                NVC0PushProgram(pNv, PFP_C_A8, NVC0FP_Composite_A8);
+                NVC0PushProgram(pNv, PFP_NV12, NVC0FP_NV12);
+
+                BEGIN_NVC0(push, NVC0_3D(MEM_BARRIER), 1);
+                PUSH_DATA (push, 0x1111);
+        } else
+        if (pNv->dev->chipset < 0xf0) {
+                NVC0PushProgram(pNv, PVP_PASS, NVE0VP_Transform2);
+                NVC0PushProgram(pNv, PFP_S, NVE0FP_Source);
+                NVC0PushProgram(pNv, PFP_C, NVE0FP_Composite);
+                NVC0PushProgram(pNv, PFP_CCA, NVE0FP_CAComposite);
+                NVC0PushProgram(pNv, PFP_CCASA, NVE0FP_CACompositeSrcAlpha);
+                NVC0PushProgram(pNv, PFP_S_A8, NVE0FP_Source_A8);
+                NVC0PushProgram(pNv, PFP_C_A8, NVE0FP_Composite_A8);
+                NVC0PushProgram(pNv, PFP_NV12, NVE0FP_NV12);
+        } else {
+                NVC0PushProgram(pNv, PVP_PASS, NVF0VP_Transform2);
+                NVC0PushProgram(pNv, PFP_S, NVF0FP_Source);
+                NVC0PushProgram(pNv, PFP_C, NVF0FP_Composite);
+                NVC0PushProgram(pNv, PFP_CCA, NVF0FP_CAComposite);
+                NVC0PushProgram(pNv, PFP_CCASA, NVF0FP_CACompositeSrcAlpha);
+                NVC0PushProgram(pNv, PFP_S_A8, NVF0FP_Source_A8);
+                NVC0PushProgram(pNv, PFP_C_A8, NVF0FP_Composite_A8);
+                NVC0PushProgram(pNv, PFP_NV12, NVF0FP_NV12);
+        }
+
+        BEGIN_NVC0(push, NVC0_3D(SP_SELECT(1)), 4);
+        PUSH_DATA (push, NVC0_3D_SP_SELECT_PROGRAM_VP_B |
+                         NVC0_3D_SP_SELECT_ENABLE);
+        PUSH_DATA (push, PVP_PASS);
+        PUSH_DATA (push, 0x00000000);
+        PUSH_DATA (push, 8);
+        BEGIN_NVC0(push, NVC0_3D(VERT_COLOR_CLAMP_EN), 1);
+        PUSH_DATA (push, 1);
+        BEGIN_NVC0(push, NVC0_3D(CB_SIZE), 3);
+        PUSH_DATA (push, 256);
+        PUSH_DATA (push, (bo->offset + PVP_DATA) >> 32);
+        PUSH_DATA (push, (bo->offset + PVP_DATA));
+        BEGIN_NVC0(push, NVC0_3D(CB_BIND(0)), 1);
+        PUSH_DATA (push, 0x01);
+
+        BEGIN_NVC0(push, NVC0_3D(SP_SELECT(5)), 4);
+        PUSH_DATA (push, NVC0_3D_SP_SELECT_PROGRAM_FP |
+                         NVC0_3D_SP_SELECT_ENABLE);
+        PUSH_DATA (push, PFP_S);
+        PUSH_DATA (push, 0x00000000);
+        PUSH_DATA (push, 8);
+        BEGIN_NVC0(push, NVC0_3D(FRAG_COLOR_CLAMP_EN), 1);
+        PUSH_DATA (push, 0x11111111);
+        BEGIN_NVC0(push, NVC0_3D(CB_SIZE), 3);
+        PUSH_DATA (push, 256);
+        PUSH_DATA (push, (bo->offset + PFP_DATA) >> 32);
+        PUSH_DATA (push, (bo->offset + PFP_DATA));
+        BEGIN_NVC0(push, NVC0_3D(CB_BIND(4)), 1);
+        PUSH_DATA (push, 0x01);
+
+        return TRUE;
+}
+*/
+
+
+
 static void nouveau_destroy(struct gralloc_drm_drv_t *drv)
 {
 	struct nouveau_info *info = (struct nouveau_info *) drv;
 
 	if (info->chan) {
+		/*nouveau_accel_free(info);*/
 		nouveau_takedown_dma(info);
 		info->chan = NULL;
 	}
@@ -605,9 +823,37 @@ struct gralloc_drm_drv_t *gralloc_drm_drv_create_for_nouveau(int fd)
 	
 	}	
 
+	/* Create and map a scratch buffer 
+	if (info->chan) {
+		err = nouveau_bo_new(info->dev, NOUVEAU_BO_VRAM | NOUVEAU_BO_MAP,
+				     128 * 1024, 128 * 1024, NULL, &info->scratch);
+		if (!err) {
+			err = nouveau_bo_map(info->scratch, 0, info->client);
+			if (err) {
+				ALOGE("PST DEBUG - Failed to allocate scratch buffer: %d",err);
+				nouveau_takedown_dma(info);
+			}
+		}
+		else {
+			ALOGE("PST DEBUG - Failed to map scratch buffer: %d",err);
+			nouveau_accel_free(info);
+			nouveau_takedown_dma(info);
+		}
+
+	}
+
+	// INit 2D and M2FM 
+	if (info->chan) {
+		nouveau_init2D_NVC0(info);
+		nouveau_initM2MF_NVC0(info);
+	}
+	*/
+
+
 	err = nouveau_init(info);
 	if (err) {
 		if (info->chan) {
+			/*nouveau_accel_free(info);*/
 			nouveau_takedown_dma(info);
 			info->chan = NULL;
 		}
