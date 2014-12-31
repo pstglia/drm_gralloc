@@ -26,8 +26,6 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#define LOG_TAG "GRALLOC-NOUVEAU"
-
 #include <cutils/log.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -67,6 +65,7 @@ struct nouveau_info {
 	struct nouveau_object *NvRectangle;
 	struct nouveau_object *NvRop;
 	struct nouveau_object *vblank_sem;
+	struct nouveau_object *NvCOPY;
 	int              currentRop;
 	int arch;
 	int tiled_scanout;
@@ -368,16 +367,16 @@ static int nouveau_map(struct gralloc_drm_drv_t *drv,
 static void nouveau_unmap(struct gralloc_drm_drv_t *drv,
 		struct gralloc_drm_bo_t *bo)
 {
-	struct nouveau_buffer *nb = (struct nouveau_buffer *) bo;
+	//struct nouveau_buffer *nb = (struct nouveau_buffer *) bo;
 	/* TODO if tiled, unmap the linear bo and copy back */
 
-	ALOGI("DEBUG PST - Inside nouveau_unmap");
+	//ALOGI("DEBUG PST - Inside nouveau_unmap");
 
 	/* Replaced noveau_bo_unmap (not existant in libdrm anymore) by these 2 cmd  */
 	/* nouveau_bo_del execute these cmds, but it also release the bo... */
 	/* TODO: Confirm if this is the best way for unmapping bo */
-	munmap(nb->bo->map, nb->bo->size);
-	nb->bo->map = NULL;
+	//munmap(nb->bo->map, nb->bo->size);
+	//nb->bo->map = NULL;
 }
 
 static void nouveau_init_kms_features(struct gralloc_drm_drv_t *drv,
@@ -389,7 +388,7 @@ static void nouveau_init_kms_features(struct gralloc_drm_drv_t *drv,
 	case HAL_PIXEL_FORMAT_BGRA_8888:
 	/* pstglia: This mode (HAL_PIXEL_FORMAT_RGB_565) was not supported in my tests - so I disabled it*/
 	/* please confirm it */
-	//case HAL_PIXEL_FORMAT_RGB_565:
+	case HAL_PIXEL_FORMAT_RGB_565:
 		break;
 	default:
 		drm->primary.fb_format = HAL_PIXEL_FORMAT_BGRA_8888;
@@ -438,6 +437,50 @@ void nouveau_accel_free(struct nouveau_info *info)
         nouveau_object_del(&info->NvMemFormat);
 	nouveau_bo_ref(NULL, &info->scratch);
 }
+
+/* The filtering function used for video scaling. We use a cubic filter as
+ * defined in  "Reconstruction Filters in Computer Graphics" Mitchell &
+ * Netravali in SIGGRAPH '88
+ */
+static float filter_func(float x)
+{
+	const double B=0.75;
+	const double C=(1.0-B)/2.0;
+	double x1=fabs(x);
+	double x2=fabs(x)*x1;
+	double x3=fabs(x)*x2;
+
+	if (fabs(x)<1.0)
+		return ( (12.0-9.0*B-6.0*C)*x3+(-18.0+12.0*B+6.0*C)*x2+(6.0-2.0*B) )/6.0; 
+	else
+		return ( (-B-6.0*C)*x3+(6.0*B+30.0*C)*x2+(-12.0*B-48.0*C)*x1+(8.0*B+24.0*C) )/6.0;
+}
+
+static int8_t f32tosb8(float v)
+{
+	return (int8_t)(v*127.0);
+}
+
+void
+NVXVComputeBicubicFilter(struct nouveau_bo *bo, unsigned offset, unsigned size)
+{
+	int8_t *t = (int8_t *)(bo->map + offset);
+	int i;
+
+	for(i = 0; i < size; i++) {
+		float  x = (i + 0.5) / size;
+		float w0 = filter_func(x+1.0);
+		float w1 = filter_func(x);
+		float w2 = filter_func(x-1.0);
+		float w3 = filter_func(x-2.0);
+
+		t[4*i+2]=f32tosb8(1.0+x-w1/(w0+w1));
+		t[4*i+1]=f32tosb8(1.0-x+w3/(w2+w3));
+		t[4*i+0]=f32tosb8(w0+w1);
+		t[4*i+3]=f32tosb8(0.0);
+	}
+}
+
 
 int NVAccelInitDmaNotifier0(struct nouveau_info *info)
 {
@@ -1197,7 +1240,7 @@ int NVAccelInitNV50TCL(struct nouveau_info *info)
 
 int NVAccelInit2D_NVC0(struct nouveau_info *info)
 {
-	/*struct nouveau_pushbuf *push = info->pushbuf;
+	struct nouveau_pushbuf *push = info->pushbuf;
 	int ret;
 
 	ret = nouveau_object_new(info->chan, 0x0000902d, 0x902d,
@@ -1236,50 +1279,1133 @@ int NVAccelInit2D_NVC0(struct nouveau_info *info)
 	PUSH_DATA (push, 2);
 	PUSH_DATA (push, 1);
 
-	info->currentRop = 0xfffffffa;*/
+	info->currentRop = 0xfffffffa;
 	return TRUE;
 }
 
 int NVAccelInitM2MF_NVC0(struct nouveau_info *info)
 {
-	/* stub*/
-  	return TRUE;
+	struct nouveau_pushbuf *push = info->pushbuf;
+	int ret;
+
+	ret = nouveau_object_new(info->chan, 0x00009039, 0x9039,
+				 NULL, 0, &info->NvMemFormat);
+	if (ret)
+		return FALSE;
+
+	BEGIN_NVC0(push, NV01_SUBC(M2MF, OBJECT), 1);
+	PUSH_DATA (push, info->NvMemFormat->handle);
+	BEGIN_NVC0(push, NVC0_M2MF(QUERY_ADDRESS_HIGH), 3);
+	PUSH_DATA (push, (info->scratch->offset + NTFY_OFFSET) >> 32);
+	PUSH_DATA (push, (info->scratch->offset + NTFY_OFFSET));
+	PUSH_DATA (push, 0);
+
+	return TRUE;
 }
 
 int NVAccelInitP2MF_NVE0(struct nouveau_info *info)
 {
-	/* stub*/
-  	return TRUE;
+	struct nouveau_pushbuf *push = info->pushbuf;
+	uint32_t class = (info->dev->chipset < 0xf0) ? 0xa040 : 0xa140;
+	int ret;
+
+	ret = nouveau_object_new(info->chan, class, class, NULL, 0,
+				&info->NvMemFormat);
+	if (ret)
+		return FALSE;
+
+	BEGIN_NVC0(push, NV01_SUBC(P2MF, OBJECT), 1);
+	PUSH_DATA (push, info->NvMemFormat->handle);
+	return TRUE;
 }
 
 int NVAccelInitCOPY_NVE0(struct nouveau_info *info)
 {
-	/* stub*/
-  	return TRUE;
+	struct nouveau_pushbuf *push = info->pushbuf;
+	int ret;
+
+	ret = nouveau_object_new(info->chan, 0x0000a0b5, 0xa0b5,
+				 NULL, 0, &info->NvCOPY);
+	if (ret)
+		return FALSE;
+
+	BEGIN_NVC0(push, NV01_SUBC(COPY_NVC0, OBJECT), 1);
+	PUSH_DATA (push, info->NvCOPY->handle);
+	return TRUE;
 }
 
 int NVAccelInitNV40TCL(struct nouveau_info *info)
 {
-	/* stub*/
-  	return TRUE;
+	struct nouveau_pushbuf *push = info->pushbuf;
+	struct nv04_fifo *fifo = info->chan->data;
+	uint32_t class = 0, chipset;
+	int i;
+
+	NVXVComputeBicubicFilter(info->scratch, XV_TABLE, XV_TABLE_SIZE);
+
+	chipset = info->dev->chipset;
+	if ((chipset & 0xf0) == NV_ARCH_40) {
+		chipset &= 0xf;
+		if (NV30_3D_CHIPSET_4X_MASK & (1<<chipset))
+			class = NV40_3D_CLASS;
+		else if (NV44TCL_CHIPSET_4X_MASK & (1<<chipset))
+			class = NV44_3D_CLASS;
+		else {
+			ALOGE("NV40EXA: Unknown chipset NV4%1x\n", chipset);
+			return FALSE;
+		}
+	} else if ( (chipset & 0xf0) == 0x60) {
+		class = NV44_3D_CLASS;
+	} else
+		return TRUE;
+
+	if (nouveau_object_new(info->chan, Nv3D, class, NULL, 0, &info->Nv3D))
+		return FALSE;
+
+	if (!PUSH_SPACE(push, 256))
+		return FALSE;
+
+	BEGIN_NV04(push, NV01_SUBC(3D, OBJECT), 1);
+	PUSH_DATA (push, info->Nv3D->handle);
+	BEGIN_NV04(push, NV30_3D(DMA_NOTIFY), 1);
+	PUSH_DATA (push, info->notify0->handle);
+	BEGIN_NV04(push, NV30_3D(DMA_TEXTURE0), 2);
+	PUSH_DATA (push, fifo->vram);
+	PUSH_DATA (push, fifo->gart);
+	BEGIN_NV04(push, NV30_3D(DMA_COLOR0), 2);
+	PUSH_DATA (push, fifo->vram);
+	PUSH_DATA (push, fifo->vram);
+
+	/* voodoo */
+	BEGIN_NV04(push, SUBC_3D(0x1ea4), 3);
+	PUSH_DATA (push, 0x00000010);
+	PUSH_DATA (push, 0x01000100);
+	PUSH_DATA (push, 0xff800006);
+	BEGIN_NV04(push, SUBC_3D(0x1fc4), 1);
+	PUSH_DATA (push, 0x06144321);
+	BEGIN_NV04(push, SUBC_3D(0x1fc8), 2);
+	PUSH_DATA (push, 0xedcba987);
+	PUSH_DATA (push, 0x00000021);
+	BEGIN_NV04(push, SUBC_3D(0x1fd0), 1);
+	PUSH_DATA (push, 0x00171615);
+	BEGIN_NV04(push, SUBC_3D(0x1fd4), 1);
+	PUSH_DATA (push, 0x001b1a19);
+	BEGIN_NV04(push, SUBC_3D(0x1ef8), 1);
+	PUSH_DATA (push, 0x0020ffff);
+	BEGIN_NV04(push, SUBC_3D(0x1d64), 1);
+	PUSH_DATA (push, 0x00d30000);
+	BEGIN_NV04(push, SUBC_3D(0x1e94), 1);
+	PUSH_DATA (push, 0x00000001);
+
+	/* This removes the the stair shaped tearing that i get. */
+	/* Verified on one G70 card that it doesn't cause regressions for people without the problem. */
+	/* The blob sets this up by default for NV43. */
+	BEGIN_NV04(push, SUBC_3D(0x1450), 1);
+	PUSH_DATA (push, 0x0000000F);
+
+	BEGIN_NV04(push, NV30_3D(VIEWPORT_TRANSLATE_X), 8);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+
+	/* default 3D state */
+	/*XXX: replace with the same state that the DRI emits on startup */
+	BEGIN_NV04(push, NV30_3D(STENCIL_ENABLE(0)), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(STENCIL_ENABLE(1)), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(ALPHA_FUNC_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(DEPTH_WRITE_ENABLE), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(COLOR_MASK), 1);
+	PUSH_DATA (push, 0x01010101); /* TR,TR,TR,TR */
+	BEGIN_NV04(push, NV30_3D(CULL_FACE_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(BLEND_FUNC_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(COLOR_LOGIC_OP_ENABLE), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, NV30_3D_COLOR_LOGIC_OP_OP_COPY);
+	BEGIN_NV04(push, NV30_3D(DITHER_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(SHADE_MODEL), 1);
+	PUSH_DATA (push, NV30_3D_SHADE_MODEL_SMOOTH);
+	BEGIN_NV04(push, NV30_3D(POLYGON_OFFSET_FACTOR),2);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	BEGIN_NV04(push, NV30_3D(POLYGON_MODE_FRONT), 2);
+	PUSH_DATA (push, NV30_3D_POLYGON_MODE_FRONT_FILL);
+	PUSH_DATA (push, NV30_3D_POLYGON_MODE_BACK_FILL);
+	BEGIN_NV04(push, NV30_3D(POLYGON_STIPPLE_PATTERN(0)), 0x20);
+	for (i=0;i<0x20;i++)
+		PUSH_DATA (push, 0xFFFFFFFF);
+	for (i=0;i<16;i++) {
+		BEGIN_NV04(push, NV30_3D(TEX_ENABLE(i)), 1);
+		PUSH_DATA (push, 0);
+	}
+
+	BEGIN_NV04(push, SUBC_3D(0x1d78), 1);
+	PUSH_DATA (push, 0x110);
+
+	BEGIN_NV04(push, NV30_3D(RT_ENABLE), 1);
+	PUSH_DATA (push, NV30_3D_RT_ENABLE_COLOR0);
+
+	BEGIN_NV04(push, NV30_3D(RT_HORIZ), 2);
+	PUSH_DATA (push, (4096 << 16));
+	PUSH_DATA (push, (4096 << 16));
+	BEGIN_NV04(push, NV30_3D(SCISSOR_HORIZ), 2);
+	PUSH_DATA (push, (4096 << 16));
+	PUSH_DATA (push, (4096 << 16));
+	BEGIN_NV04(push, NV30_3D(VIEWPORT_HORIZ), 2);
+	PUSH_DATA (push, (4096 << 16));
+	PUSH_DATA (push, (4096 << 16));
+	BEGIN_NV04(push, NV30_3D(VIEWPORT_CLIP_HORIZ(0)), 2);
+	PUSH_DATA (push, (4095 << 16));
+	PUSH_DATA (push, (4095 << 16));
+
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_FROM_ID), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x401f9c6c); /* mov o[hpos], a[0] */
+	PUSH_DATA (push, 0x0040000d);
+	PUSH_DATA (push, 0x8106c083);
+	PUSH_DATA (push, 0x6041ef80);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00001c6c); /* mov r0.xyw, a[8].xyww */
+	PUSH_DATA (push, 0x0040080f);
+	PUSH_DATA (push, 0x8106c083);
+	PUSH_DATA (push, 0x6041affc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00009c6c); /* dp3 r1.x, r0.xyw, c[0].xyz */
+	PUSH_DATA (push, 0x0140000f);
+	PUSH_DATA (push, 0x808680c3);
+	PUSH_DATA (push, 0x60410ffc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00009c6c); /* dp3 r1.y, r0.xyw, c[1].xyz */
+	PUSH_DATA (push, 0x0140100f);
+	PUSH_DATA (push, 0x808680c3);
+	PUSH_DATA (push, 0x60408ffc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00009c6c); /* dp3 r1.w, r0.xyw, c[2].xyz */
+	PUSH_DATA (push, 0x0140200f);
+	PUSH_DATA (push, 0x808680c3);
+	PUSH_DATA (push, 0x60402ffc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x401f9c6c); /* mul o[tex0].xyw, r1, c[3] */
+	PUSH_DATA (push, 0x0080300d);
+	PUSH_DATA (push, 0x8286c0c3);
+	PUSH_DATA (push, 0x6041af9c);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00001c6c); /* mov r0.xyw, a[9].xyww */
+	PUSH_DATA (push, 0x0040090f);
+	PUSH_DATA (push, 0x8106c083);
+	PUSH_DATA (push, 0x6041affc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00009c6c); /* dp3 r1.x, r0.xyw, c[4].xyz */
+	PUSH_DATA (push, 0x0140400f);
+	PUSH_DATA (push, 0x808680c3);
+	PUSH_DATA (push, 0x60410ffc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00009c6c); /* dp3 r1.y, r0.xyw, c[5].xyz */
+	PUSH_DATA (push, 0x0140500f);
+	PUSH_DATA (push, 0x808680c3);
+	PUSH_DATA (push, 0x60408ffc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00009c6c); /* dp3 r1.w, r0.xyw, c[6].xyz */
+	PUSH_DATA (push, 0x0140600f);
+	PUSH_DATA (push, 0x808680c3);
+	PUSH_DATA (push, 0x60402ffc);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x401f9c6c); /* exit mul o[tex1].xyw, r1, c[4] */
+	PUSH_DATA (push, 0x0080700d);
+	PUSH_DATA (push, 0x8286c0c3);
+	PUSH_DATA (push, 0x6041afa1);
+	BEGIN_NV04(push, NV30_3D(VP_UPLOAD_INST(0)), 4);
+	PUSH_DATA (push, 0x00000000); /* exit */
+	PUSH_DATA (push, 0x00000000);
+	PUSH_DATA (push, 0x00000000);
+	PUSH_DATA (push, 0x00000001);
+	BEGIN_NV04(push, NV30_3D(VP_START_FROM_ID), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV40_3D(VP_ATTRIB_EN), 2);
+	PUSH_DATA (push, 0x00000309);
+	PUSH_DATA (push, 0x0000c001);
+
+	PUSH_DATAu(push, info->scratch, PFP_PASS, 1 * 4);
+	PUSH_DATAs(push, 0x01403e81); /* mov r0, a[col0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_S_NV04, 2 * 4);
+	PUSH_DATAs(push, 0x18009e00); /* txp r0, a[tex0], t[0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x01401e81); /* mov r0, r0 */
+	PUSH_DATAs(push, 0x1c9dc800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_S_A8_NV04, 2 * 4);
+	PUSH_DATAs(push, 0x18009000); /* txp r0.w, a[tex0], t[0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x01401e81); /* mov r0, r0.w */
+	PUSH_DATAs(push, 0x1c9dfe00);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_C_NV04, 3 * 4);
+	PUSH_DATAs(push, 0x1802b102); /* txpc0 r1.w, a[tex1], t[1] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x18009e00); /* txp r0 (ne0.w), a[tex0], t[0] */
+	PUSH_DATAs(push, 0x1ff5c801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x02001e81); /* mul r0, r0, r1.w */
+	PUSH_DATAs(push, 0x1c9dc800);
+	PUSH_DATAs(push, 0x0001fe04);
+	PUSH_DATAs(push, 0x0001c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_C_A8_NV04, 3 * 4);
+	PUSH_DATAs(push, 0x1802b102); /* txpc0 r1.w, a[tex1], t[1] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x18009000); /* txp r0.w (ne0.w), a[tex0], t[0] */
+	PUSH_DATAs(push, 0x1ff5c801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x02001e81); /* mul r0, r0.w, r1.w */
+	PUSH_DATAs(push, 0x1c9dfe00);
+	PUSH_DATAs(push, 0x0001fe04);
+	PUSH_DATAs(push, 0x0001c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_CCA_NV04, 3 * 4);
+	PUSH_DATAs(push, 0x18009f00); /* txpc0 r0, a[tex0], t[0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x1802be02); /* txp r1 (ne0), a[tex1], t[1] */
+	PUSH_DATAs(push, 0x1c95c801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x02001e81); /* mul r0, r0, r1 */
+	PUSH_DATAs(push, 0x1c9dc800);
+	PUSH_DATAs(push, 0x0001c804);
+	PUSH_DATAs(push, 0x0001c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_CCASA_NV04, 3 * 4);
+	PUSH_DATAs(push, 0x18009102); /* txpc0 r1.w, a[tex0], t[0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x1802be00); /* txp r0 (ne0.w), a[tex1], t[1] */
+	PUSH_DATAs(push, 0x1ff5c801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x02001e81); /* mul r0, r1.w, r0 */
+	PUSH_DATAs(push, 0x1c9dfe04);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_NV12_BILINEAR, 8 * 4);
+	PUSH_DATAs(push, 0x17028200); /* texr r0.x, a[tex0], t[1] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x04000e02); /* madr r1.xyz, r0.x, imm.x, imm.yzww */
+	PUSH_DATAs(push, 0x1c9c0000);
+	PUSH_DATAs(push, 0x00000002);
+	PUSH_DATAs(push, 0x0001f202);
+	PUSH_DATAs(push, 0x3f9507c8); /* { 1.16, -0.87, 0.53, -1.08 } */
+	PUSH_DATAs(push, 0xbf5ee393);
+	PUSH_DATAs(push, 0x3f078fef);
+	PUSH_DATAs(push, 0xbf8a6762);
+	PUSH_DATAs(push, 0x1704ac80); /* texr r0.yz, a[tex1], t[2] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x04000e02); /* madr r1.xyz, r0.y, imm, r1 */
+	PUSH_DATAs(push, 0x1c9cab00);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c804);
+	PUSH_DATAs(push, 0x00000000); /* { 0.00, -0.39, 2.02, 0.00 } */
+	PUSH_DATAs(push, 0xbec890d6);
+	PUSH_DATAs(push, 0x40011687);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x04000e81); /* madr r0.xyz, r0.z, imm, r1 */
+	PUSH_DATAs(push, 0x1c9d5500);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c804);
+	PUSH_DATAs(push, 0x3fcc432d); /* { 1.60, -0.81, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0xbf501a37);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+
+
+	PUSH_DATAu(push, info->scratch, PFP_NV12_BICUBIC, 29 * 4);
+	PUSH_DATAs(push, 0x01008600); /* movr r0.xy, a[tex0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x03000800); /* addr r0.z, r0.y, imm.x */
+	PUSH_DATAs(push, 0x1c9caa00);
+	PUSH_DATAs(push, 0x00000002);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3f000000); /* { 0.50, 0.00, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x03000202); /* addr r1.x, r0, imm.x */
+	PUSH_DATAs(push, 0x1c9dc800);
+	PUSH_DATAs(push, 0x00000002);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3f000000); /* { 0.50, 0.00, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x17000f82); /* texrc0 r1.xyz, r0.z, t[0] */
+	PUSH_DATAs(push, 0x1c9d5400);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x02001404); /* mulr r2.yw, r1.xxyy, imm.xxyy */
+	PUSH_DATAs(push, 0x1c9ca104);
+	PUSH_DATAs(push, 0x0000a002);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0xbf800000); /* { -1.00, 1.00, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0x3f800000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x17000e86); /* texr r3.xyz, r1, t[0] */
+	PUSH_DATAs(push, 0x1c9dc804);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x02000a04); /* mulr r2.xz, r3.xxyy, imm.xxyy */
+	PUSH_DATAs(push, 0x1c9ca10c);
+	PUSH_DATAs(push, 0x0000a002);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0xbf800000); /* { -1.00, 1.00, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0x3f800000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x03001e04); /* addr r2, r0.xyxy, r2 */
+	PUSH_DATAs(push, 0x1c9c8800);
+	PUSH_DATAs(push, 0x0001c808);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x17020402); /* texr r1.y, r2.zwzz, -t[1] */
+	PUSH_DATAs(push, 0x1c9d5c08);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x04400282); /* madh r1.x, -r1.z, r1.y, r1.y */
+	PUSH_DATAs(push, 0x1c9f5504);
+	PUSH_DATAs(push, 0x0000aa04);
+	PUSH_DATAs(push, 0x0000aa04);
+	PUSH_DATAs(push, 0x17020400); /* texr r0.y, r2.xwxw, -t[1] */
+	PUSH_DATAs(push, 0x1c9d9808);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x04401080); /* madh r0.w, -r1.z, r0.y, r0.y */
+	PUSH_DATAs(push, 0x1c9f5504);
+	PUSH_DATAs(push, 0x0000aa00);
+	PUSH_DATAs(push, 0x0000aa00);
+	PUSH_DATAs(push, 0x17020200); /* texr r0.x, r2.zyxy, t[1] */
+	PUSH_DATAs(push, 0x1c9c8c08);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x04400282); /* madh r1.x, r1.z, r0, r1 */
+	PUSH_DATAs(push, 0x1c9d5504);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c904);
+	PUSH_DATAs(push, 0x17020200); /* texr r0.x (NE0.z), r2, t[1] */
+	PUSH_DATAs(push, 0x1555c808);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x04400280); /* madh r0.x, r1.z, r0, r0.w */
+	PUSH_DATAs(push, 0x1c9d5504);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001ff00);
+	PUSH_DATAs(push, 0x04401080); /* madh r0.w, -r3.z, r1.x, r1.x */
+	PUSH_DATAs(push, 0x1c9f550c);
+	PUSH_DATAs(push, 0x00000104);
+	PUSH_DATAs(push, 0x00000104);
+	PUSH_DATAs(push, 0x1704ac80); /* texr r0.yz, a[tex1], t[2] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x04400280); /* madh r0.x, r3.z, r0, r0.w */
+	PUSH_DATAs(push, 0x1c9d550c);
+	PUSH_DATAs(push, 0x0001c900);
+	PUSH_DATAs(push, 0x0001ff00);
+	PUSH_DATAs(push, 0x04400e82); /* madh r1.xyz, r0.x, imm.x, imm.yzww */
+	PUSH_DATAs(push, 0x1c9c0100);
+	PUSH_DATAs(push, 0x00000002);
+	PUSH_DATAs(push, 0x0001f202);
+	PUSH_DATAs(push, 0x3f9507c8); /* { 1.16, -0.87, 0.53, -1.08 } */
+	PUSH_DATAs(push, 0xbf5ee393);
+	PUSH_DATAs(push, 0x3f078fef);
+	PUSH_DATAs(push, 0xbf8a6762);
+	PUSH_DATAs(push, 0x04400e82); /* madh r1.xyz, r0.y, imm, r1 */
+	PUSH_DATAs(push, 0x1c9cab00);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c904);
+	PUSH_DATAs(push, 0x00000000); /* { 0.00, -0.39, 2.02, 0.00 } */
+	PUSH_DATAs(push, 0xbec890d6);
+	PUSH_DATAs(push, 0x40011687);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x04400e81); /* madh r0.xyz, r0.z, imm, r1 */
+	PUSH_DATAs(push, 0x1c9d5500);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c904);
+	PUSH_DATAs(push, 0x3fcc432d); /* { 1.60, -0.81, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0xbf501a37);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	return TRUE;
 }
 
 int NVAccelInitNV30TCL(struct nouveau_info *info)
 {
-	/* stub*/
-  	return TRUE;
+	struct nouveau_pushbuf *push = info->pushbuf;
+	struct nv04_fifo *fifo = info->chan->data;
+	uint32_t class = 0, chipset;
+	int i;
+
+	NVXVComputeBicubicFilter(info->scratch, XV_TABLE, XV_TABLE_SIZE);
+
+#define NV30TCL_CHIPSET_3X_MASK 0x00000003
+#define NV35TCL_CHIPSET_3X_MASK 0x000001e0
+#define NV30_3D_CHIPSET_3X_MASK 0x00000010
+
+	chipset = info->dev->chipset;
+	if ((chipset & 0xf0) != NV_ARCH_30)
+		return TRUE;
+	chipset &= 0xf;
+
+	if (NV30TCL_CHIPSET_3X_MASK & (1<<chipset))
+		class = NV30_3D_CLASS;
+	else if (NV35TCL_CHIPSET_3X_MASK & (1<<chipset))
+		class = NV35_3D_CLASS;
+	else if (NV30_3D_CHIPSET_3X_MASK & (1<<chipset))
+		class = NV34_3D_CLASS;
+	else {
+		ALOGE("NV30EXA: Unknown chipset NV3%1x\n", chipset);
+		return FALSE;
+	}
+
+	if (nouveau_object_new(info->chan, Nv3D, class, NULL, 0, &info->Nv3D))
+		return FALSE;
+
+	if (!PUSH_SPACE(push, 256))
+		return FALSE;
+
+	BEGIN_NV04(push, NV01_SUBC(3D, OBJECT), 1);
+	PUSH_DATA (push, info->Nv3D->handle);
+	BEGIN_NV04(push, NV30_3D(DMA_TEXTURE0), 3);
+	PUSH_DATA (push, fifo->vram);
+	PUSH_DATA (push, fifo->gart);
+	PUSH_DATA (push, fifo->vram);
+	BEGIN_NV04(push, NV30_3D(DMA_UNK1AC), 1);
+	PUSH_DATA (push, fifo->vram);
+	BEGIN_NV04(push, NV30_3D(DMA_COLOR0), 2);
+	PUSH_DATA (push, fifo->vram);
+	PUSH_DATA (push, fifo->vram);
+	BEGIN_NV04(push, NV30_3D(DMA_UNK1B0), 1);
+	PUSH_DATA (push, fifo->vram);
+
+	for (i=1; i<8; i++) {
+		BEGIN_NV04(push, NV30_3D(VIEWPORT_CLIP_HORIZ(i)), 2);
+		PUSH_DATA (push, 0);
+		PUSH_DATA (push, 0);
+	}
+
+	BEGIN_NV04(push, SUBC_3D(0x220), 1);
+	PUSH_DATA (push, 1);
+
+	BEGIN_NV04(push, SUBC_3D(0x03b0), 1);
+	PUSH_DATA (push, 0x00100000);
+	BEGIN_NV04(push, SUBC_3D(0x1454), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, SUBC_3D(0x1d80), 1);
+	PUSH_DATA (push, 3);
+	BEGIN_NV04(push, SUBC_3D(0x1450), 1);
+	PUSH_DATA (push, 0x00030004);
+
+	/* NEW */
+	BEGIN_NV04(push, SUBC_3D(0x1e98), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, SUBC_3D(0x17e0), 3);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0x3f800000);
+	BEGIN_NV04(push, SUBC_3D(0x1f80), 16);
+	PUSH_DATA (push, 0); PUSH_DATA (push, 0); PUSH_DATA (push, 0); PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0); PUSH_DATA (push, 0); PUSH_DATA (push, 0); PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0x0000ffff);
+	PUSH_DATA (push, 0); PUSH_DATA (push, 0); PUSH_DATA (push, 0); PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0); PUSH_DATA (push, 0); PUSH_DATA (push, 0);
+
+	BEGIN_NV04(push, SUBC_3D(0x120), 3);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 1);
+	PUSH_DATA (push, 2);
+
+	BEGIN_NV04(push, SUBC_BLIT(0x120), 3);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 1);
+	PUSH_DATA (push, 2);
+
+	BEGIN_NV04(push, SUBC_3D(0x1d88), 1);
+	PUSH_DATA (push, 0x00001200);
+
+	BEGIN_NV04(push, NV30_3D(MULTISAMPLE_CONTROL), 1);
+	PUSH_DATA (push, 0xffff0000);
+
+	/* Attempt to setup a known state.. Probably missing a heap of
+	 * stuff here..
+	 */
+	BEGIN_NV04(push, NV30_3D(STENCIL_ENABLE(0)), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(STENCIL_ENABLE(1)), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(ALPHA_FUNC_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(DEPTH_WRITE_ENABLE), 2);
+	PUSH_DATA (push, 0); /* wr disable */
+	PUSH_DATA (push, 0); /* test disable */
+	BEGIN_NV04(push, NV30_3D(COLOR_MASK), 1);
+	PUSH_DATA (push, 0x01010101); /* TR,TR,TR,TR */
+	BEGIN_NV04(push, NV30_3D(CULL_FACE_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV30_3D(BLEND_FUNC_ENABLE), 5);
+	PUSH_DATA (push, 0);				/* Blend enable */
+	PUSH_DATA (push, 0);				/* Blend src */
+	PUSH_DATA (push, 0);				/* Blend dst */
+	PUSH_DATA (push, 0x00000000);			/* Blend colour */
+	PUSH_DATA (push, 0x8006);			/* FUNC_ADD */
+	BEGIN_NV04(push, NV30_3D(COLOR_LOGIC_OP_ENABLE), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0x1503 /*GL_COPY*/);
+	BEGIN_NV04(push, NV30_3D(DITHER_ENABLE), 1);
+	PUSH_DATA (push, 1);
+	BEGIN_NV04(push, NV30_3D(SHADE_MODEL), 1);
+	PUSH_DATA (push, 0x1d01 /*GL_SMOOTH*/);
+	BEGIN_NV04(push, NV30_3D(POLYGON_OFFSET_FACTOR),2);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	BEGIN_NV04(push, NV30_3D(POLYGON_MODE_FRONT), 2);
+	PUSH_DATA (push, 0x1b02 /*GL_FILL*/);
+	PUSH_DATA (push, 0x1b02 /*GL_FILL*/);
+	/* - Disable texture units
+	 * - Set fragprog to MOVR result.color, fragment.color */
+	for (i=0;i<4;i++) {
+		BEGIN_NV04(push, NV30_3D(TEX_ENABLE(i)), 1);
+		PUSH_DATA (push, 0);
+	}
+	/* Polygon stipple */
+	BEGIN_NV04(push, NV30_3D(POLYGON_STIPPLE_PATTERN(0)), 0x20);
+	for (i=0;i<0x20;i++)
+		PUSH_DATA (push, 0xFFFFFFFF);
+
+	BEGIN_NV04(push, NV30_3D(DEPTH_RANGE_NEAR), 2);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+
+	/* Ok.  If you start X with the nvidia driver, kill it, and then
+	 * start X with nouveau you will get black rendering instead of
+	 * what you'd expect.  This fixes the problem, and it seems that
+	 * it's not needed between nouveau restarts - which suggests that
+	 * the 3D context (wherever it's stored?) survives somehow.
+	 */
+	//BEGIN_NV04(push, SUBC_3D(0x1d60),1);
+	//PUSH_DATA (push, 0x03008000);
+
+	int w=4096;
+	int h=4096;
+	int pitch=4096*4;
+	BEGIN_NV04(push, NV30_3D(RT_HORIZ), 5);
+	PUSH_DATA (push, w<<16);
+	PUSH_DATA (push, h<<16);
+	PUSH_DATA (push, 0x148); /* format */
+	PUSH_DATA (push, pitch << 16 | pitch);
+	PUSH_DATA (push, 0x0);
+	BEGIN_NV04(push, NV30_3D(VIEWPORT_TX_ORIGIN), 1);
+	PUSH_DATA (push, 0);
+        BEGIN_NV04(push, SUBC_3D(0x0a00), 2);
+        PUSH_DATA (push, (w<<16) | 0);
+        PUSH_DATA (push, (h<<16) | 0);
+	BEGIN_NV04(push, NV30_3D(VIEWPORT_CLIP_HORIZ(0)), 2);
+	PUSH_DATA (push, (w-1)<<16);
+	PUSH_DATA (push, (h-1)<<16);
+	BEGIN_NV04(push, NV30_3D(SCISSOR_HORIZ), 2);
+	PUSH_DATA (push, w<<16);
+	PUSH_DATA (push, h<<16);
+	BEGIN_NV04(push, NV30_3D(VIEWPORT_HORIZ), 2);
+	PUSH_DATA (push, w<<16);
+	PUSH_DATA (push, h<<16);
+
+	BEGIN_NV04(push, NV30_3D(VIEWPORT_TRANSLATE_X), 8);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+
+	BEGIN_NV04(push, NV30_3D(MODELVIEW_MATRIX(0)), 16);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+
+	BEGIN_NV04(push, NV30_3D(PROJECTION_MATRIX(0)), 16);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+
+	BEGIN_NV04(push, NV30_3D(SCISSOR_HORIZ), 2);
+	PUSH_DATA (push, 4096<<16);
+	PUSH_DATA (push, 4096<<16);
+
+	PUSH_DATAu(push, info->scratch, PFP_PASS, 2 * 4);
+	PUSH_DATAs(push, 0x18009e80); /* txph r0, a[tex0], t[0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x1802be83); /* txph r1, a[tex1], t[1] */
+	PUSH_DATAs(push, 0x1c9dc801); /* exit */
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+
+	PUSH_DATAu(push, info->scratch, PFP_NV12_BILINEAR, 8 * 4);
+	PUSH_DATAs(push, 0x17028200); /* texr r0.x, a[tex0], t[1] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x04000e02); /* madr r1.xyz, r0.x, imm.x, imm.yzww */
+	PUSH_DATAs(push, 0x1c9c0000);
+	PUSH_DATAs(push, 0x00000002);
+	PUSH_DATAs(push, 0x0001f202);
+	PUSH_DATAs(push, 0x3f9507c8); /* { 1.16, -0.87, 0.53, -1.08 } */
+	PUSH_DATAs(push, 0xbf5ee393);
+	PUSH_DATAs(push, 0x3f078fef);
+	PUSH_DATAs(push, 0xbf8a6762);
+	PUSH_DATAs(push, 0x1704ac80); /* texr r0.yz, a[tex1], t[2] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3fe1c800);
+	PUSH_DATAs(push, 0x04000e02); /* madr r1.xyz, r0.y, imm, r1 */
+	PUSH_DATAs(push, 0x1c9cab00);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c804);
+	PUSH_DATAs(push, 0x00000000); /* { 0.00, -0.39, 2.02, 0.00 } */
+	PUSH_DATAs(push, 0xbec890d6);
+	PUSH_DATAs(push, 0x40011687);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x04000e81); /* madr r0.xyz, r0.z, imm, r1 */
+	PUSH_DATAs(push, 0x1c9d5500);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c804);
+	PUSH_DATAs(push, 0x3fcc432d); /* { 1.60, -0.81, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0xbf501a37);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+
+	PUSH_DATAu(push, info->scratch, PFP_NV12_BICUBIC, 24 * 4);
+	PUSH_DATAs(push, 0x01008604); /* movr r2.xy, a[tex0] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x03000600); /* addr r0.xy, r2, imm.x */
+	PUSH_DATAs(push, 0x1c9dc808);
+	PUSH_DATAs(push, 0x00000002);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x3f000000); /* { 0.50, 0.00, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x17000e06); /* texr r3.xyz, r0, t[0] */
+	PUSH_DATAs(push, 0x1c9dc800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x17000e00); /* texr r0.xyz, r0.y, t[0] */
+	PUSH_DATAs(push, 0x1c9caa00);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x02000a02); /* mulr r1.xz, r3.xxyy, imm.xxyy */
+	PUSH_DATAs(push, 0x1c9ca00c);
+	PUSH_DATAs(push, 0x0000a002);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0xbf800000); /* { -1.00, 1.00, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0x3f800000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x02001402); /* mulr r1.yw, r0.xxyy, imm.xxyy */
+	PUSH_DATAs(push, 0x1c9ca000);
+	PUSH_DATAs(push, 0x0000a002);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0xbf800000); /* { -1.00, 1.00, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0x3f800000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x03001e04); /* addr r2, r2.xyxy, r1 */
+	PUSH_DATAs(push, 0x1c9c8808);
+	PUSH_DATAs(push, 0x0001c804);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x17020200); /* texr r0.x, r2, t[1] */
+	PUSH_DATAs(push, 0x1c9dc808);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x17020402); /* texr r1.y, r2.xwxw, t[1] */
+	PUSH_DATAs(push, 0x1c9d9808);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x17020202); /* texr r1.x, r2.zyxy, t[1] */
+	PUSH_DATAs(push, 0x1c9c8c08);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x1f400280); /* lrph r0.x, r0.z, r0, r1.y */
+	PUSH_DATAs(push, 0x1c9d5400);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0000aa04);
+	PUSH_DATAs(push, 0x17020400); /* texr r0.y, r2.zwzz, t[1] */
+	PUSH_DATAs(push, 0x1c9d5c08);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x1f400480); /* lrph r0.y, r0.z, r1.x, r0 */
+	PUSH_DATAs(push, 0x1c9d5400);
+	PUSH_DATAs(push, 0x00000004);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x1f400280); /* lrph r0.x, r3.z, r0, r0.y */
+	PUSH_DATAs(push, 0x1c9d540c);
+	PUSH_DATAs(push, 0x0001c900);
+	PUSH_DATAs(push, 0x0000ab00);
+	PUSH_DATAs(push, 0x04400e80); /* madh r0.xyz, r0.x, imm.x, imm.yzww */
+	PUSH_DATAs(push, 0x1c9c0100);
+	PUSH_DATAs(push, 0x00000002);
+	PUSH_DATAs(push, 0x0001f202);
+	PUSH_DATAs(push, 0x3f9507c8); /* { 1.16, -0.87, 0.53, -1.08 } */
+	PUSH_DATAs(push, 0xbf5ee393);
+	PUSH_DATAs(push, 0x3f078fef);
+	PUSH_DATAs(push, 0xbf8a6762);
+	PUSH_DATAs(push, 0x1704ac02); /* texr r1.yz, a[tex1], t[2] */
+	PUSH_DATAs(push, 0x1c9dc801);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x0001c800);
+	PUSH_DATAs(push, 0x04400e80); /* madh r0.xyz, r1.y, imm, r0 */
+	PUSH_DATAs(push, 0x1c9caa04);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c900);
+	PUSH_DATAs(push, 0x00000000); /* { 0.00, -0.39, 2.02, 0.00 } */
+	PUSH_DATAs(push, 0xbec890d6);
+	PUSH_DATAs(push, 0x40011687);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x04400e81); /* madh r0.xyz, r1.z, imm, r0 */
+	PUSH_DATAs(push, 0x1c9d5404);
+	PUSH_DATAs(push, 0x0001c802);
+	PUSH_DATAs(push, 0x0001c900);
+	PUSH_DATAs(push, 0x3fcc432d); /* { 1.60, -0.81, 0.00, 0.00 } */
+	PUSH_DATAs(push, 0xbf501a37);
+	PUSH_DATAs(push, 0x00000000);
+	PUSH_DATAs(push, 0x00000000);
+
+	return TRUE;
 }
 
 int NVAccelInitNV10TCL(struct nouveau_info *info)
 {
-	/* stub*/
-  	return TRUE;
+	struct nouveau_pushbuf *push = info->pushbuf;
+	struct nv04_fifo *fifo = info->chan->data;
+	uint32_t class = 0;
+	int i;
+
+	if (((info->dev->chipset & 0xf0) != NV_ARCH_10) &&
+	    ((info->dev->chipset & 0xf0) != NV_ARCH_20))
+		return FALSE;
+
+	if (info->dev->chipset >= 0x20 || info->dev->chipset == 0x1a)
+		class = NV15_3D_CLASS;
+	else if (info->dev->chipset >= 0x17)
+		class = NV17_3D_CLASS;
+	else if (info->dev->chipset >= 0x11)
+		class = NV15_3D_CLASS;
+	else
+		class = NV10_3D_CLASS;
+
+	if (nouveau_object_new(info->chan, Nv3D, class, NULL, 0, &info->Nv3D))
+		return FALSE;
+
+	if (!PUSH_SPACE(push, 256))
+		return FALSE;
+
+	BEGIN_NV04(push, NV01_SUBC(3D, OBJECT), 1);
+	PUSH_DATA (push, info->Nv3D->handle);
+	BEGIN_NV04(push, NV10_3D(DMA_NOTIFY), 1);
+	PUSH_DATA (push, info->NvNull->handle);
+
+	BEGIN_NV04(push, NV10_3D(DMA_TEXTURE0), 2);
+	PUSH_DATA (push, fifo->vram);
+	PUSH_DATA (push, fifo->gart);
+
+	BEGIN_NV04(push, NV10_3D(DMA_COLOR), 2);
+	PUSH_DATA (push, fifo->vram);
+	PUSH_DATA (push, fifo->vram);
+
+	BEGIN_NV04(push, NV04_GRAPH(3D, NOP), 1);
+	PUSH_DATA (push, 0);
+
+	BEGIN_NV04(push, NV10_3D(RT_HORIZ), 2);
+	PUSH_DATA (push, 2048 << 16 | 0);
+	PUSH_DATA (push, 2048 << 16 | 0);
+
+	BEGIN_NV04(push, NV10_3D(ZETA_OFFSET), 1);
+	PUSH_DATA (push, 0);
+
+	BEGIN_NV04(push, NV10_3D(VIEWPORT_CLIP_MODE), 1);
+	PUSH_DATA (push, 0);
+
+	BEGIN_NV04(push, NV10_3D(VIEWPORT_CLIP_HORIZ(0)), 1);
+	PUSH_DATA (push, 0x7ff << 16 | 0x800);
+	BEGIN_NV04(push, NV10_3D(VIEWPORT_CLIP_VERT(0)), 1);
+	PUSH_DATA (push, 0x7ff << 16 | 0x800);
+
+	for (i = 1; i < 8; i++) {
+		BEGIN_NV04(push, NV10_3D(VIEWPORT_CLIP_HORIZ(i)), 1);
+		PUSH_DATA (push, 0);
+		BEGIN_NV04(push, NV10_3D(VIEWPORT_CLIP_VERT(i)), 1);
+		PUSH_DATA (push, 0);
+	}
+
+	BEGIN_NV04(push, SUBC_3D(0x290), 1);
+	PUSH_DATA (push, (0x10<<16)|1);
+	BEGIN_NV04(push, SUBC_3D(0x3f4), 1);
+	PUSH_DATA (push, 0);
+
+	BEGIN_NV04(push, NV04_GRAPH(3D, NOP), 1);
+	PUSH_DATA (push, 0);
+
+	if (class != NV10_3D_CLASS) {
+		/* For nv11, nv17 */
+		BEGIN_NV04(push, SUBC_3D(0x120), 3);
+		PUSH_DATA (push, 0);
+		PUSH_DATA (push, 1);
+		PUSH_DATA (push, 2);
+
+		BEGIN_NV04(push, SUBC_BLIT(0x120), 3);
+		PUSH_DATA (push, 0);
+		PUSH_DATA (push, 1);
+		PUSH_DATA (push, 2);
+
+		BEGIN_NV04(push, NV04_GRAPH(3D, NOP), 1);
+		PUSH_DATA (push, 0);
+	}
+
+	BEGIN_NV04(push, NV04_GRAPH(3D, NOP), 1);
+	PUSH_DATA (push, 0);
+
+	/* Set state */
+	BEGIN_NV04(push, NV10_3D(FOG_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(ALPHA_FUNC_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(ALPHA_FUNC_FUNC), 2);
+	PUSH_DATA (push, 0x207);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(TEX_ENABLE(0)), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(RC_IN_ALPHA(0)), 6);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(RC_OUT_ALPHA(0)), 6);
+	PUSH_DATA (push, 0x00000c00);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0x00000c00);
+	PUSH_DATA (push, 0x18000000);
+	PUSH_DATA (push, 0x300c0000);
+	PUSH_DATA (push, 0x00001c80);
+	BEGIN_NV04(push, NV10_3D(BLEND_FUNC_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(DITHER_ENABLE), 2);
+	PUSH_DATA (push, 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(LINE_SMOOTH_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(VERTEX_WEIGHT_ENABLE), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(BLEND_FUNC_SRC), 4);
+	PUSH_DATA (push, 1);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0x8006);
+	BEGIN_NV04(push, NV10_3D(STENCIL_MASK), 8);
+	PUSH_DATA (push, 0xff);
+	PUSH_DATA (push, 0x207);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0xff);
+	PUSH_DATA (push, 0x1e00);
+	PUSH_DATA (push, 0x1e00);
+	PUSH_DATA (push, 0x1e00);
+	PUSH_DATA (push, 0x1d01);
+	BEGIN_NV04(push, NV10_3D(NORMALIZE_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(FOG_ENABLE), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(LIGHT_MODEL), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(SEPARATE_SPECULAR_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(ENABLED_LIGHTS), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(POLYGON_OFFSET_POINT_ENABLE), 3);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(DEPTH_FUNC), 1);
+	PUSH_DATA (push, 0x201);
+	BEGIN_NV04(push, NV10_3D(DEPTH_WRITE_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(DEPTH_TEST_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(POLYGON_OFFSET_FACTOR), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(POINT_SIZE), 1);
+	PUSH_DATA (push, 8);
+	BEGIN_NV04(push, NV10_3D(POINT_PARAMETERS_ENABLE), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(LINE_WIDTH), 1);
+	PUSH_DATA (push, 8);
+	BEGIN_NV04(push, NV10_3D(LINE_SMOOTH_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(POLYGON_MODE_FRONT), 2);
+	PUSH_DATA (push, 0x1b02);
+	PUSH_DATA (push, 0x1b02);
+	BEGIN_NV04(push, NV10_3D(CULL_FACE), 2);
+	PUSH_DATA (push, 0x405);
+	PUSH_DATA (push, 0x901);
+	BEGIN_NV04(push, NV10_3D(POLYGON_SMOOTH_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(CULL_FACE_ENABLE), 1);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(TEX_GEN_MODE(0, 0)), 8);
+	for (i = 0; i < 8; i++)
+		PUSH_DATA (push, 0);
+
+	BEGIN_NV04(push, NV10_3D(FOG_COEFF(0)), 3);
+	PUSH_DATA (push, 0x3fc00000);	/* -1.50 */
+	PUSH_DATA (push, 0xbdb8aa0a);	/* -0.09 */
+	PUSH_DATA (push, 0);		/*  0.00 */
+
+	BEGIN_NV04(push, NV04_GRAPH(3D, NOP), 1);
+	PUSH_DATA (push, 0);
+
+	BEGIN_NV04(push, NV10_3D(FOG_MODE), 2);
+	PUSH_DATA (push, 0x802);
+	PUSH_DATA (push, 2);
+	/* for some reason VIEW_MATRIX_ENABLE need to be 6 instead of 4 when
+	 * using texturing, except when using the texture matrix
+	 */
+	BEGIN_NV04(push, NV10_3D(VIEW_MATRIX_ENABLE), 1);
+	PUSH_DATA (push, 6);
+	BEGIN_NV04(push, NV10_3D(COLOR_MASK), 1);
+	PUSH_DATA (push, 0x01010101);
+
+	BEGIN_NV04(push, NV10_3D(PROJECTION_MATRIX(0)), 16);
+	for(i = 0; i < 16; i++)
+		PUSH_DATAf(push, i/4 == i%4 ? 1.0 : 0.0);
+
+	BEGIN_NV04(push, NV10_3D(DEPTH_RANGE_NEAR), 2);
+	PUSH_DATA (push, 0);
+	PUSH_DATAf(push, 65536.0);
+
+	BEGIN_NV04(push, NV10_3D(VIEWPORT_TRANSLATE_X), 4);
+	PUSH_DATAf(push, -2048.0);
+	PUSH_DATAf(push, -2048.0);
+	PUSH_DATAf(push, 0);
+	PUSH_DATA (push, 0);
+
+	/* Set vertex component */
+	BEGIN_NV04(push, NV10_3D(VERTEX_COL_4F_R), 4);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 1.0);
+	PUSH_DATAf(push, 1.0);
+	BEGIN_NV04(push, NV10_3D(VERTEX_COL2_3F_R), 3);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	BEGIN_NV04(push, NV10_3D(VERTEX_NOR_3F_X), 3);
+	PUSH_DATA (push, 0);
+	PUSH_DATA (push, 0);
+	PUSH_DATAf(push, 1.0);
+	BEGIN_NV04(push, NV10_3D(VERTEX_TX0_4F_S), 4);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	BEGIN_NV04(push, NV10_3D(VERTEX_TX1_4F_S), 4);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 0.0);
+	PUSH_DATAf(push, 1.0);
+	BEGIN_NV04(push, NV10_3D(VERTEX_FOG_1F), 1);
+	PUSH_DATAf(push, 0.0);
+	BEGIN_NV04(push, NV10_3D(EDGEFLAG_ENABLE), 1);
+	PUSH_DATA (push, 1);
+
+	return TRUE;
 }
 
 int NVAccelInit3D_NVC0(struct nouveau_info *info)
 {
 
-	/*struct nouveau_pushbuf *push = info->pushbuf;
+	struct nouveau_pushbuf *push = info->pushbuf;
 	struct nouveau_bo *bo = info->scratch;
 	uint32_t class, handle;
 	int ret;
@@ -1380,67 +2506,67 @@ int NVAccelInit3D_NVC0(struct nouveau_info *info)
 	PUSH_DATA (push, (bo->offset + CODE_OFFSET) >> 32);
 	PUSH_DATA (push, (bo->offset + CODE_OFFSET));
 	if (info->arch < NV_KEPLER) {
-		NVC0PushProgram(info, PVP_PASS, NVC0VP_Transform2);
+		NVC0PushProgram(info, PVP_PASS_NVC0, NVC0VP_Transform2);
 		NVC0PushProgram(info, PFP_S_NVC0, NVC0FP_Source);
 		NVC0PushProgram(info, PFP_C_NVC0, NVC0FP_Composite);
 		NVC0PushProgram(info, PFP_CCA_NVC0, NVC0FP_CAComposite);
 		NVC0PushProgram(info, PFP_CCASA_NVC0, NVC0FP_CACompositeSrcAlpha);
 		NVC0PushProgram(info, PFP_S_A8_NVC0, NVC0FP_Source_A8);
 		NVC0PushProgram(info, PFP_C_A8_NVC0, NVC0FP_Composite_A8);
-		NVC0PushProgram(info, PFP_NV12, NVC0FP_NV12);
+		NVC0PushProgram(info, PFP_NV12_NVC0, NVC0FP_NV12);
 
 		BEGIN_NVC0(push, NVC0_3D(MEM_BARRIER), 1);
 		PUSH_DATA (push, 0x1111);
 	} else
 	if (info->dev->chipset < 0xf0) {
-		NVC0PushProgram(info, PVP_PASS, NVE0VP_Transform2);
+		NVC0PushProgram(info, PVP_PASS_NVC0, NVE0VP_Transform2);
 		NVC0PushProgram(info, PFP_S_NVC0, NVE0FP_Source);
 		NVC0PushProgram(info, PFP_C_NVC0, NVE0FP_Composite);
 		NVC0PushProgram(info, PFP_CCA_NVC0, NVE0FP_CAComposite);
 		NVC0PushProgram(info, PFP_CCASA_NVC0, NVE0FP_CACompositeSrcAlpha);
 		NVC0PushProgram(info, PFP_S_A8_NVC0, NVE0FP_Source_A8);
 		NVC0PushProgram(info, PFP_C_A8_NVC0, NVE0FP_Composite_A8);
-		NVC0PushProgram(info, PFP_NV12, NVE0FP_NV12);
+		NVC0PushProgram(info, PFP_NV12_NVC0, NVE0FP_NV12);
 	} else {
-		NVC0PushProgram(info, PVP_PASS, NVF0VP_Transform2);
+		NVC0PushProgram(info, PVP_PASS_NVC0, NVF0VP_Transform2);
 		NVC0PushProgram(info, PFP_S_NVC0, NVF0FP_Source);
 		NVC0PushProgram(info, PFP_C_NVC0, NVF0FP_Composite);
 		NVC0PushProgram(info, PFP_CCA_NVC0, NVF0FP_CAComposite);
 		NVC0PushProgram(info, PFP_CCASA_NVC0, NVF0FP_CACompositeSrcAlpha);
 		NVC0PushProgram(info, PFP_S_A8_NVC0, NVF0FP_Source_A8);
 		NVC0PushProgram(info, PFP_C_A8_NVC0, NVF0FP_Composite_A8);
-		NVC0PushProgram(info, PFP_NV12, NVF0FP_NV12);
+		NVC0PushProgram(info, PFP_NV12_NVC0, NVF0FP_NV12);
 	}
 
 	BEGIN_NVC0(push, NVC0_3D(SP_SELECT(1)), 4);
 	PUSH_DATA (push, NVC0_3D_SP_SELECT_PROGRAM_VP_B |
 			 NVC0_3D_SP_SELECT_ENABLE);
-	PUSH_DATA (push, PVP_PASS);
+	PUSH_DATA (push, PVP_PASS_NVC0);
 	PUSH_DATA (push, 0x00000000);
 	PUSH_DATA (push, 8);
 	BEGIN_NVC0(push, NVC0_3D(VERT_COLOR_CLAMP_EN), 1);
 	PUSH_DATA (push, 1);
 	BEGIN_NVC0(push, NVC0_3D(CB_SIZE), 3);
 	PUSH_DATA (push, 256);
-	PUSH_DATA (push, (bo->offset + PVP_DATA) >> 32);
-	PUSH_DATA (push, (bo->offset + PVP_DATA));
+	PUSH_DATA (push, (bo->offset + PVP_DATA_NVC0) >> 32);
+	PUSH_DATA (push, (bo->offset + PVP_DATA_NVC0));
 	BEGIN_NVC0(push, NVC0_3D(CB_BIND(0)), 1);
 	PUSH_DATA (push, 0x01);
 
 	BEGIN_NVC0(push, NVC0_3D(SP_SELECT(5)), 4);
 	PUSH_DATA (push, NVC0_3D_SP_SELECT_PROGRAM_FP |
 			 NVC0_3D_SP_SELECT_ENABLE);
-	PUSH_DATA (push, PFP_S);
+	PUSH_DATA (push, PFP_S_NVC0);
 	PUSH_DATA (push, 0x00000000);
 	PUSH_DATA (push, 8);
 	BEGIN_NVC0(push, NVC0_3D(FRAG_COLOR_CLAMP_EN), 1);
 	PUSH_DATA (push, 0x11111111);
 	BEGIN_NVC0(push, NVC0_3D(CB_SIZE), 3);
 	PUSH_DATA (push, 256);
-	PUSH_DATA (push, (bo->offset + PFP_DATA) >> 32);
-	PUSH_DATA (push, (bo->offset + PFP_DATA));
+	PUSH_DATA (push, (bo->offset + PFP_DATA_NVC0) >> 32);
+	PUSH_DATA (push, (bo->offset + PFP_DATA_NVC0));
 	BEGIN_NVC0(push, NVC0_3D(CB_BIND(4)), 1);
-	PUSH_DATA (push, 0x01);*/
+	PUSH_DATA (push, 0x01);
 
 	return TRUE;
 }
